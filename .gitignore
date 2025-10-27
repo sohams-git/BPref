@@ -55,3 +55,27 @@ figures
 *.txt
 figure/
 data/
+envs/bpref/venv-bpref.tar.gz
+# Python cache & venvs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# TensorBoard & hydra logs (huge)
+**/tb/
+**/events.out.tfevents.*
+
+# Large training artifacts & exports
+runs/**/
+exp_*/**/
+*.pt
+*.tgz
+*/exports/**
+
+# Editor backups
+*.bak*
+*~
