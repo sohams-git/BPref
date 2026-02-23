@@ -2,6 +2,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import gym
+# try:
+#     import gymnasium as gym
+# except ImportError:
+#     import gym
 import os
 import random
 import math
@@ -16,47 +20,133 @@ from collections import deque
 from skimage.util.shape import view_as_windows
 from torch import nn
 from torch import distributions as pyd
+
+from bpref.envs import make_env as make_bpref_env
     
+
+# def make_env(cfg):
+#     """
+#     Create environment based on cfg.env.
+#     - If cfg.env looks like a Gym Mujoco id (e.g., HalfCheetah-v2), use our Gym adapter.
+#     - Else, fall back to existing DMC/Metaworld logic (imports remain lazy).
+#     """
+#     # ---- Gym Mujoco route ----
+#     env_name = getattr(cfg, "env", None)
+#     if isinstance(env_name, str) and env_name.startswith("HalfCheetah"):
+#         # Use the adapter you created
+#         try:
+#             from bpref.envs.gym_halfcheetah import GymHalfCheetah
+#         except Exception as e:
+#             raise RuntimeError("Gym adapter import failed: %r" % (e,))
+#         add_time = bool(getattr(cfg, "add_time", False))
+#         max_ep_len = int(getattr(cfg, "max_ep_len", 1000))
+#         seed = int(getattr(cfg, "seed", 0))
+#         env = GymHalfCheetah(env_id=env_name, add_time=add_time, max_ep_len=max_ep_len, seed=seed)
+#         return env
+
+#     # ---- Fall back to DMC / Metaworld (original code path) ----
+#     # Delay imports so Gym runs don't require these packages.
+#     try:
+#         import dmc2gym
+#     except Exception:
+#         # If someone tries a DMC env without dmc2gym installed, fail clearly.
+#         raise RuntimeError("DMC env requested but dmc2gym is not available. Install or stub only for Gym runs.")
+#     # Original behavior for DMC-style env names (your repo’s default)
+#     # NOTE: adapt this if your repo expects domain/task split.
+#     # For example, if cfg.env='dog_stand', the original code probably did something like:
+#     domain_task = getattr(cfg, "env", "dog_stand")
+#     # You may have original parameters like frame_skip, visualize_reward, etc.
+#     env = dmc2gym.make(
+#         domain_task.split('_')[0],            # domain (best-effort)
+#         domain_task[len(domain_task.split('_')[0])+1:],  # task
+#         seed=int(getattr(cfg, "seed", 0)),
+#         visualize_reward=False
+#     )
+#     return env
 
 def make_env(cfg):
     """
     Create environment based on cfg.env.
-    - If cfg.env looks like a Gym Mujoco id (e.g., HalfCheetah-v2), use our Gym adapter.
-    - Else, fall back to existing DMC/Metaworld logic (imports remain lazy).
+
+    Routing:
+      - If cfg.env == 'wofost-lnpkw-v0':
+          Use our WOFOST adapter (bpref.envs.WofostEnv) via bpref.envs.make_env.
+      - If cfg.env looks like a Gym Mujoco id (e.g., 'HalfCheetah-v2'):
+          Use the Gym adapter (GymHalfCheetah).
+      - Otherwise:
+          Fall back to the original DMC (dmc2gym) logic.
     """
-    # ---- Gym Mujoco route ----
     env_name = getattr(cfg, "env", None)
-    if isinstance(env_name, str) and env_name.startswith("HalfCheetah"):
-        # Use the adapter you created
-        try:
-            from bpref.envs.gym_halfcheetah import GymHalfCheetah
-        except Exception as e:
-            raise RuntimeError("Gym adapter import failed: %r" % (e,))
+
+    # ----------------------------
+    # 1) WOFOST route (pcse_gym)
+    # ----------------------------
+    if isinstance(env_name, str) and env_name == "wofost-lnpkw-v0":
+        # We delegate to bpref.envs.make_env, which knows how to build WofostEnv
+        seed = int(getattr(cfg, "seed", 0))
+        env = make_bpref_env("wofost-lnpkw-v0", seed=seed)
+        return env
+    
+
+    # -----------------------------------
+    # 2) Generic Gym Mujoco route (gym-*)
+    # -----------------------------------
+    if isinstance(env_name, str) and env_name.startswith("gym-"):
         add_time = bool(getattr(cfg, "add_time", False))
         max_ep_len = int(getattr(cfg, "max_ep_len", 1000))
         seed = int(getattr(cfg, "seed", 0))
-        env = GymHalfCheetah(env_id=env_name, add_time=add_time, max_ep_len=max_ep_len, seed=seed)
-        return env
+        return make_bpref_env(env_name, add_time=add_time, max_ep_len=max_ep_len, seed=seed)
 
-    # ---- Fall back to DMC / Metaworld (original code path) ----
-    # Delay imports so Gym runs don't require these packages.
+
+    # -----------------------------------
+    # 2) Gym Mujoco route (HalfCheetah*)
+    # -----------------------------------
+    # if isinstance(env_name, str) and env_name.startswith("HalfCheetah"):
+    #     try:
+    #         from bpref.envs.gym_halfcheetah import GymHalfCheetah
+    #     except Exception as e:
+    #         raise RuntimeError("Gym adapter import failed: %r" % (e,))
+
+    #     add_time = bool(getattr(cfg, "add_time", False))
+    #     max_ep_len = int(getattr(cfg, "max_ep_len", 1000))
+    #     seed = int(getattr(cfg, "seed", 0))
+
+    #     env = GymHalfCheetah(
+    #         env_id=env_name,
+    #         add_time=add_time,
+    #         max_ep_len=max_ep_len,
+    #         seed=seed,
+    #     )
+    #     return env
+
+    # --------------------------
+    # 3) DMC fallback (original)
+    # --------------------------
     try:
         import dmc2gym
     except Exception:
-        # If someone tries a DMC env without dmc2gym installed, fail clearly.
-        raise RuntimeError("DMC env requested but dmc2gym is not available. Install or stub only for Gym runs.")
-    # Original behavior for DMC-style env names (your repo’s default)
-    # NOTE: adapt this if your repo expects domain/task split.
-    # For example, if cfg.env='dog_stand', the original code probably did something like:
+        raise RuntimeError(
+            "DMC env requested but dmc2gym is not available. "
+            "Install dmc2gym or use a Gym/WOFOST env."
+        )
+
+    # Example: env = 'dog_stand' → domain='dog', task='stand'
     domain_task = getattr(cfg, "env", "dog_stand")
-    # You may have original parameters like frame_skip, visualize_reward, etc.
+    domain = domain_task.split("_")[0]
+    task = domain_task[len(domain) + 1 :]
+
     env = dmc2gym.make(
-        domain_task.split('_')[0],            # domain (best-effort)
-        domain_task[len(domain_task.split('_')[0])+1:],  # task
+        domain,
+        task,
         seed=int(getattr(cfg, "seed", 0)),
-        visualize_reward=False
+        visualize_reward=False,
     )
     return env
+
+def is_wofost(cfg) -> bool:
+    env_name = getattr(cfg, "env", "")
+    return isinstance(env_name, str) and env_name == "wofost-lnpkw-v0"
+
 
 def to_np(t):
     if t is None:

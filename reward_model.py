@@ -138,6 +138,13 @@ class RewardModel:
         
         self.label_margin = label_margin
         self.label_target = 1 - 2*self.label_margin
+
+        # ---- pref label stats (latest batch) ----
+        # labels use {-1, 0, 1} where:
+        #   0 => prefer seg1
+        #   1 => prefer seg2
+        #  -1 => tie
+        self.last_label_hist = None
     
     def softXEnt_loss(self, input, target):
         logprobs = torch.nn.functional.log_softmax (input, dim = 1)
@@ -309,41 +316,122 @@ class RewardModel:
         ensemble_acc = ensemble_acc / total
         return np.mean(ensemble_acc)
     
-    def get_queries(self, mb_size=20):
-        len_traj, max_len = len(self.inputs[0]), len(self.inputs)
-        img_t_1, img_t_2 = None, None
+    # def get_queries(self, mb_size=20):
+    #     len_traj, max_len = len(self.inputs[0]), len(self.inputs)
+    #     # cap segment length to available trajectory length
+    #     seg_len = min(self.size_segment, len_traj)
+    #     img_t_1, img_t_2 = None, None
         
-        if len(self.inputs[-1]) < len_traj:
-            max_len = max_len - 1
+    #     if len(self.inputs[-1]) < len_traj:
+    #         max_len = max_len - 1
         
-        # get train traj
-        train_inputs = np.array(self.inputs[:max_len])
-        train_targets = np.array(self.targets[:max_len])
+    #     # get train traj
+    #     train_inputs = np.array(self.inputs[:max_len])
+    #     train_targets = np.array(self.targets[:max_len])
    
-        batch_index_2 = np.random.choice(max_len, size=mb_size, replace=True)
-        sa_t_2 = train_inputs[batch_index_2] # Batch x T x dim of s&a
-        r_t_2 = train_targets[batch_index_2] # Batch x T x 1
+    #     batch_index_2 = np.random.choice(max_len, size=mb_size, replace=True)
+    #     sa_t_2 = train_inputs[batch_index_2] # Batch x T x dim of s&a
+    #     r_t_2 = train_targets[batch_index_2] # Batch x T x 1
         
-        batch_index_1 = np.random.choice(max_len, size=mb_size, replace=True)
-        sa_t_1 = train_inputs[batch_index_1] # Batch x T x dim of s&a
-        r_t_1 = train_targets[batch_index_1] # Batch x T x 1
+    #     batch_index_1 = np.random.choice(max_len, size=mb_size, replace=True)
+    #     sa_t_1 = train_inputs[batch_index_1] # Batch x T x dim of s&a
+    #     r_t_1 = train_targets[batch_index_1] # Batch x T x 1
                 
-        sa_t_1 = sa_t_1.reshape(-1, sa_t_1.shape[-1]) # (Batch x T) x dim of s&a
-        r_t_1 = r_t_1.reshape(-1, r_t_1.shape[-1]) # (Batch x T) x 1
-        sa_t_2 = sa_t_2.reshape(-1, sa_t_2.shape[-1]) # (Batch x T) x dim of s&a
-        r_t_2 = r_t_2.reshape(-1, r_t_2.shape[-1]) # (Batch x T) x 1
+    #     sa_t_1 = sa_t_1.reshape(-1, sa_t_1.shape[-1]) # (Batch x T) x dim of s&a
+    #     r_t_1 = r_t_1.reshape(-1, r_t_1.shape[-1]) # (Batch x T) x 1
+    #     sa_t_2 = sa_t_2.reshape(-1, sa_t_2.shape[-1]) # (Batch x T) x dim of s&a
+    #     r_t_2 = r_t_2.reshape(-1, r_t_2.shape[-1]) # (Batch x T) x 1
 
-        # Generate time index 
-        time_index = np.array([list(range(i*len_traj,
-                                            i*len_traj+self.size_segment)) for i in range(mb_size)])
-        time_index_2 = time_index + np.random.choice(len_traj-self.size_segment, size=mb_size, replace=True).reshape(-1,1)
-        time_index_1 = time_index + np.random.choice(len_traj-self.size_segment, size=mb_size, replace=True).reshape(-1,1)
+    #     # Generate time index 
+    #     time_index = np.array([
+    #         list(range(i * len_traj, i * len_traj + seg_len))
+    #         for i in range(mb_size)
+    #     ])
+    #     # time_index_2 = time_index + np.random.choice(len_traj-self.size_segment, size=mb_size, replace=True).reshape(-1,1)
+    #     # time_index_1 = time_index + np.random.choice(len_traj-self.size_segment, size=mb_size, replace=True).reshape(-1,1)
         
-        sa_t_1 = np.take(sa_t_1, time_index_1, axis=0) # Batch x size_seg x dim of s&a
-        r_t_1 = np.take(r_t_1, time_index_1, axis=0) # Batch x size_seg x 1
-        sa_t_2 = np.take(sa_t_2, time_index_2, axis=0) # Batch x size_seg x dim of s&a
-        r_t_2 = np.take(r_t_2, time_index_2, axis=0) # Batch x size_seg x 1
+    #     # safe start index sampling (handles len_traj <= size_segment)
+    #     max_start = len_traj - seg_len
+    #     if max_start <= 0:
+    #         start_1 = np.zeros(mb_size, dtype=int)
+    #         start_2 = np.zeros(mb_size, dtype=int)
+    #     else:
+    #         # valid starts are 0..max_start (inclusive)
+    #         start_1 = np.random.randint(0, max_start + 1, size=mb_size)
+    #         start_2 = np.random.randint(0, max_start + 1, size=mb_size)
+
+    #     time_index_1 = time_index + start_1.reshape(-1, 1)
+    #     time_index_2 = time_index + start_2.reshape(-1, 1)
+
+    #     flatN = sa_t_1.shape[0]  # should be mb_size * len_traj after reshape
+    #     if time_index_1.max() >= flatN or time_index_2.max() >= flatN:
+    #         raise RuntimeError(
+    #             f"Index bug: max_idx={max(time_index_1.max(), time_index_2.max())} "
+    #             f"flatN={flatN} len_traj={len_traj} seg={self.size_segment} seg_len={seg_len} max_start={max_start}"
+    #         )
+
+    #     sa_t_1 = np.take(sa_t_1, time_index_1, axis=0) # Batch x size_seg x dim of s&a
+    #     r_t_1 = np.take(r_t_1, time_index_1, axis=0) # Batch x size_seg x 1
+    #     sa_t_2 = np.take(sa_t_2, time_index_2, axis=0) # Batch x size_seg x dim of s&a
+    #     r_t_2 = np.take(r_t_2, time_index_2, axis=0) # Batch x size_seg x 1
                 
+    #     return sa_t_1, sa_t_2, r_t_1, r_t_2
+
+    def get_queries(self, mb_size=20):
+        seg = int(self.size_segment)
+
+        # --- collect complete trajectories (drop last if it's the "currently-being-filled" one) ---
+        trajs_sa = self.inputs
+        trajs_r  = self.targets
+
+        if len(trajs_sa) == 0:
+            return None
+
+        # your add_data() appends [] after done; drop incomplete tail
+        if isinstance(trajs_sa[-1], list) or len(trajs_sa[-1]) == 0:
+            trajs_sa = trajs_sa[:-1]
+            trajs_r  = trajs_r[:-1]
+
+        if len(trajs_sa) < 2:
+            return None
+
+        # --- Option C: keep only trajectories long enough for seg sampling ---
+        valid = []
+        for sa, rr in zip(trajs_sa, trajs_r):
+            # sa: (T, ds+da), rr: (T,1)
+            if sa is None or rr is None:
+                continue
+            if hasattr(sa, "__len__") and len(sa) >= seg:
+                valid.append((sa, rr))
+
+        if len(valid) < 2:
+            return None  # not enough data yet
+
+        # --- sample pairs ---
+        sa_t_1 = np.empty((mb_size, seg, self.ds + self.da), dtype=np.float32)
+        sa_t_2 = np.empty((mb_size, seg, self.ds + self.da), dtype=np.float32)
+        r_t_1  = np.empty((mb_size, seg, 1), dtype=np.float32)
+        r_t_2  = np.empty((mb_size, seg, 1), dtype=np.float32)
+
+        n = len(valid)
+        for i in range(mb_size):
+            idx1 = np.random.randint(0, n)
+            idx2 = np.random.randint(0, n)
+
+            sa1, rr1 = valid[idx1]
+            sa2, rr2 = valid[idx2]
+
+            T1 = len(sa1)
+            T2 = len(sa2)
+
+            s1 = np.random.randint(0, T1 - seg + 1)
+            s2 = np.random.randint(0, T2 - seg + 1)
+
+            sa_t_1[i] = sa1[s1:s1 + seg]
+            sa_t_2[i] = sa2[s2:s2 + seg]
+            r_t_1[i]  = rr1[s1:s1 + seg]
+            r_t_2[i]  = rr2[s2:s2 + seg]
+
         return sa_t_1, sa_t_2, r_t_1, r_t_2
 
     def put_queries(self, sa_t_1, sa_t_2, labels):
@@ -418,6 +506,28 @@ class RewardModel:
  
         # equally preferable
         labels[margin_index] = -1 
+
+        # ---- store label distribution for logging (per round) ----
+        # labels are in {-1,0,1} where:
+        #   0 => prefer seg1  (your "+1" bucket if you want)
+        #   1 => prefer seg2  (your "-1" bucket if you want)
+        #  -1 => tie          (your "0" bucket)
+        lbl = labels.reshape(-1)
+
+        n_total = int(lbl.shape[0])
+        n_tie   = int((lbl == -1).sum())
+        n_seg1  = int((lbl == 0).sum())
+        n_seg2  = int((lbl == 1).sum())
+
+        self.last_label_hist = {
+            "n_total": n_total,
+            "prefer_seg1": n_seg1,  # (+1) if you map it that way
+            "prefer_seg2": n_seg2,  # (-1) if you map it that way
+            "tie": n_tie,           # (0) if you map it that way
+            "p_prefer_seg1": (n_seg1 / n_total) if n_total > 0 else 0.0,
+            "p_prefer_seg2": (n_seg2 / n_total) if n_total > 0 else 0.0,
+            "p_tie":         (n_tie  / n_total) if n_total > 0 else 0.0,
+        }
         
         return sa_t_1, sa_t_2, r_t_1, r_t_2, labels
     
@@ -542,38 +652,92 @@ class RewardModel:
         
         return len(labels)
     
-    def uniform_sampling(self):
-        # get queries
-        sa_t_1, sa_t_2, r_t_1, r_t_2 =  self.get_queries(
-            mb_size=self.mb_size)
+    # def uniform_sampling(self):
+    #     # get queries
+    #     sa_t_1, sa_t_2, r_t_1, r_t_2 =  self.get_queries(
+    #         mb_size=self.mb_size)
             
-        # get labels
-        sa_t_1, sa_t_2, r_t_1, r_t_2, labels = self.get_label(
-            sa_t_1, sa_t_2, r_t_1, r_t_2)
+    #     # get labels
+    #     sa_t_1, sa_t_2, r_t_1, r_t_2, labels = self.get_label(
+    #         sa_t_1, sa_t_2, r_t_1, r_t_2)
         
-        if len(labels) > 0:
-            self.put_queries(sa_t_1, sa_t_2, labels)
+    #     if len(labels) > 0:
+    #         self.put_queries(sa_t_1, sa_t_2, labels)
         
+    #     return len(labels)
+
+    def uniform_sampling(self):
+        out = self.get_queries(mb_size=self.mb_size)
+        if out is None:
+            return 0
+
+        sa_t_1, sa_t_2, r_t_1, r_t_2 = out
+
+        out2 = self.get_label(sa_t_1, sa_t_2, r_t_1, r_t_2)
+        if out2 is None:
+            return 0
+
+        sa_t_1, sa_t_2, r_t_1, r_t_2, labels = out2
+
+        # get_label can return labels=[] when everything is skipped
+        if labels is None or len(labels) == 0:
+            return 0
+
+        self.put_queries(sa_t_1, sa_t_2, labels)
         return len(labels)
     
+    # def disagreement_sampling(self):
+        
+    #     # get queries
+    #     sa_t_1, sa_t_2, r_t_1, r_t_2 =  self.get_queries(
+    #         mb_size=self.mb_size*self.large_batch)
+        
+    #     # get final queries based on uncertainty
+    #     _, disagree = self.get_rank_probability(sa_t_1, sa_t_2)
+    #     top_k_index = (-disagree).argsort()[:self.mb_size]
+    #     r_t_1, sa_t_1 = r_t_1[top_k_index], sa_t_1[top_k_index]
+    #     r_t_2, sa_t_2 = r_t_2[top_k_index], sa_t_2[top_k_index]        
+        
+    #     # get labels
+    #     sa_t_1, sa_t_2, r_t_1, r_t_2, labels = self.get_label(
+    #         sa_t_1, sa_t_2, r_t_1, r_t_2)        
+    #     if len(labels) > 0:
+    #         self.put_queries(sa_t_1, sa_t_2, labels)
+        
+    #     return len(labels)
+
     def disagreement_sampling(self):
-        
-        # get queries
-        sa_t_1, sa_t_2, r_t_1, r_t_2 =  self.get_queries(
-            mb_size=self.mb_size*self.large_batch)
-        
-        # get final queries based on uncertainty
+        out = self.get_queries(mb_size=int(self.mb_size * self.large_batch))
+        if out is None:
+            return 0
+
+        sa_t_1, sa_t_2, r_t_1, r_t_2 = out
+
+        # if for some reason mb_size==0
+        if sa_t_1 is None or len(sa_t_1) == 0:
+            return 0
+
+        # uncertainty over ensemble
         _, disagree = self.get_rank_probability(sa_t_1, sa_t_2)
-        top_k_index = (-disagree).argsort()[:self.mb_size]
+
+        # choose top-k most disagreement
+        k = min(int(self.mb_size), len(disagree))
+        if k <= 0:
+            return 0
+
+        top_k_index = (-disagree).argsort()[:k]
         r_t_1, sa_t_1 = r_t_1[top_k_index], sa_t_1[top_k_index]
-        r_t_2, sa_t_2 = r_t_2[top_k_index], sa_t_2[top_k_index]        
-        
-        # get labels
-        sa_t_1, sa_t_2, r_t_1, r_t_2, labels = self.get_label(
-            sa_t_1, sa_t_2, r_t_1, r_t_2)        
-        if len(labels) > 0:
-            self.put_queries(sa_t_1, sa_t_2, labels)
-        
+        r_t_2, sa_t_2 = r_t_2[top_k_index], sa_t_2[top_k_index]
+
+        out2 = self.get_label(sa_t_1, sa_t_2, r_t_1, r_t_2)
+        if out2 is None:
+            return 0
+
+        sa_t_1, sa_t_2, r_t_1, r_t_2, labels = out2
+        if labels is None or len(labels) == 0:
+            return 0
+
+        self.put_queries(sa_t_1, sa_t_2, labels)
         return len(labels)
     
     def entropy_sampling(self):

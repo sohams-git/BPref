@@ -19,65 +19,169 @@ from collections import deque
 import utils
 import hydra
 
+import importlib
+from omegaconf import DictConfig, ListConfig, open_dict  # add this near your other imports
+
+
+def build_agent_from_cfg(agent_cfg: DictConfig):
+    """
+    agent_cfg is expected to look like:
+      agent:
+        name: sac
+        class: agent.sac.SACAgent
+        params: { ... }
+
+    Here we:
+      - import the class from `agent_cfg.class`
+      - pass `agent_cfg.params` as **kwargs
+
+    Nested fields like critic_cfg / actor_cfg stay as DictConfig,
+    so SACAgent can still call hydra.utils.instantiate() on them.
+    """
+    cls_path = agent_cfg["class"]
+    params_cfg = agent_cfg["params"]   # DictConfig
+
+    module_name, class_name = cls_path.rsplit(".", 1)
+    mod = importlib.import_module(module_name)
+    AgentCls = getattr(mod, class_name)
+
+    # pass DictConfig directly; Hydra instantiate is not used here,
+    # but SACAgent will use hydra.utils.instantiate on critic_cfg/actor_cfg.
+    return AgentCls(**params_cfg)
+
+
 class Workspace(object):
     def __init__(self, cfg):
         self.work_dir = os.getcwd()
         print(f'workspace: {self.work_dir}')
 
         self.cfg = cfg
+
+        # Robustly get agent name so logger works for all envs
+        try:
+            agent_name = cfg.agent.name
+        except Exception:
+            try:
+                agent_name = cfg.agent.get("name", "sac")
+            except Exception:
+                agent_name = "sac"
+
         self.logger = Logger(
             self.work_dir,
             save_tb=cfg.log_save_tb,
             log_frequency=cfg.log_frequency,
-            agent=cfg.agent.name)
+            agent=agent_name,
+        )
 
         utils.set_seed_everywhere(cfg.seed)
         self.device = torch.device(cfg.device)
         self.log_success = False
-        
-        # make env
-        if 'metaworld' in cfg.env:
+
+        # -------------------
+        # 1) Make environment
+        # -------------------
+        if "metaworld" in cfg.env:
             self.env = utils.make_metaworld_env(cfg)
             self.log_success = True
         else:
             self.env = utils.make_env(cfg)
-        
-        cfg.agent.params.obs_dim = self.env.observation_space.shape[0]
-        cfg.agent.params.action_dim = self.env.action_space.shape[0]
-        cfg.agent.params.action_range = [
-            float(self.env.action_space.low.min()),
-            float(self.env.action_space.high.max())
-        ]
-        self.agent = hydra.utils.instantiate(cfg.agent)
 
+        # -------------------
+        # 1b) Figure out max episode length in a robust way
+        # -------------------
+        if hasattr(self.env, "_max_episode_steps"):
+            self.max_episode_steps = int(self.env._max_episode_steps)
+        elif hasattr(self.env, "spec") and getattr(self.env.spec, "max_episode_steps", None) is not None:
+            self.max_episode_steps = int(self.env.spec.max_episode_steps)
+        else:
+            self.max_episode_steps = int(getattr(cfg, "max_episode_steps", 365))
+
+        # -------------------
+        # 2) Infer obs/action dims & range
+        # -------------------
+        obs_dim = self.env.observation_space.shape[0]
+
+        action_space = self.env.action_space
+        if (
+            hasattr(action_space, "shape")
+            and action_space.shape is not None
+            and len(action_space.shape) > 0
+        ):
+            # Continuous action space (e.g., HalfCheetah, DMC)
+            action_dim = action_space.shape[0]
+            action_range = [
+                float(action_space.low.min()),
+                float(action_space.high.max()),
+            ]
+            action_shape = action_space.shape
+        else:
+            # Discrete action space (e.g., WOFOST Discrete(17))
+            action_dim = 1
+            action_range = [0.0, float(action_space.n - 1)]
+            action_shape = (action_dim,)
+
+        # Write back into config for SACAgent, critic, actor, etc.
+        cfg.agent.params.obs_dim = int(obs_dim)
+        cfg.agent.params.action_dim = int(action_dim)
+        cfg.agent.params.action_range = action_range
+
+        # with open_dict(cfg):
+        #     if "agent" not in cfg or cfg["agent"] is None:
+        #         cfg["agent"] = {}
+        #     if "params" not in cfg["agent"] or cfg["agent"]["params"] is None:
+        #         cfg["agent"]["params"] = {}
+
+        #     cfg["agent"]["params"]["obs_dim"] = int(obs_dim)
+        #     cfg["agent"]["params"]["action_dim"] = int(action_dim)
+        #     cfg["agent"]["params"]["action_range"] = action_range
+
+        # -------------------
+        # 3) Build agent
+        # -------------------
+        self.agent = build_agent_from_cfg(cfg.agent)
+
+        # -------------------
+        # 4) Replay buffer
+        # -------------------
         self.replay_buffer = ReplayBuffer(
             self.env.observation_space.shape,
-            self.env.action_space.shape,
+            action_shape,
             int(cfg.replay_buffer_capacity),
-            self.device)
-        
-        # for logging
+            self.device,
+        )
+
+        # For logging
         self.total_feedback = 0
         self.labeled_feedback = 0
         self.step = 0
 
-        # instantiating the reward model
+        # -------------------
+        # 5) Reward model (Tier-2: WOFOST-only segment override)
+        # -------------------
+        size_segment = int(cfg.segment)
+
+        if utils.is_wofost(cfg) and getattr(cfg, "wofost", None) is not None and cfg.wofost.enable_tier2:
+            if cfg.wofost.segment_len_override is not None:
+                size_segment = int(cfg.wofost.segment_len_override)
+                print(f"[WOFOST Tier2] Overriding segment length: {cfg.segment} -> {size_segment}")
+
         self.reward_model = RewardModel(
-            self.env.observation_space.shape[0],
-            self.env.action_space.shape[0],
+            obs_dim,
+            action_dim,
             ensemble_size=cfg.ensemble_size,
-            size_segment=cfg.segment,
-            activation=cfg.activation, 
+            size_segment=size_segment,
+            activation=cfg.activation,
             lr=cfg.reward_lr,
-            mb_size=cfg.reward_batch, 
-            large_batch=cfg.large_batch, 
-            label_margin=cfg.label_margin, 
-            teacher_beta=cfg.teacher_beta, 
-            teacher_gamma=cfg.teacher_gamma, 
-            teacher_eps_mistake=cfg.teacher_eps_mistake, 
-            teacher_eps_skip=cfg.teacher_eps_skip, 
-            teacher_eps_equal=cfg.teacher_eps_equal)
-        
+            mb_size=cfg.reward_batch,
+            large_batch=cfg.large_batch,
+            label_margin=cfg.label_margin,
+            teacher_beta=cfg.teacher_beta,
+            teacher_gamma=cfg.teacher_gamma,
+            teacher_eps_mistake=cfg.teacher_eps_mistake,
+            teacher_eps_skip=cfg.teacher_eps_skip,
+            teacher_eps_equal=cfg.teacher_eps_equal,
+        )
+
     def evaluate(self):
         average_episode_reward = 0
         average_true_episode_reward = 0
@@ -149,6 +253,29 @@ class Workspace(object):
         
         self.total_feedback += self.reward_model.mb_size
         self.labeled_feedback += labeled_queries
+
+        # ----------------------------------------
+        # Pref label distribution logging (per round)
+        # ----------------------------------------
+        hist = getattr(self.reward_model, "last_label_hist", None)
+        if hist is not None:
+            # Console print (easy sanity check)
+            print(
+                f"[pref] step={self.step} mb={self.reward_model.mb_size} "
+                f"n={hist['n_total']} seg1={hist['prefer_seg1']} "
+                f"seg2={hist['prefer_seg2']} tie={hist['tie']} "
+                f"p1={hist['p_prefer_seg1']:.3f} p2={hist['p_prefer_seg2']:.3f} ptie={hist['p_tie']:.3f}"
+            )
+
+            # TensorBoard scalars
+            self.logger.log("pref/n_total", hist["n_total"], self.step)
+            self.logger.log("pref/n_prefer_seg1", hist["prefer_seg1"], self.step)
+            self.logger.log("pref/n_prefer_seg2", hist["prefer_seg2"], self.step)
+            self.logger.log("pref/n_tie", hist["tie"], self.step)
+
+            self.logger.log("pref/p_prefer_seg1", hist["p_prefer_seg1"], self.step)
+            self.logger.log("pref/p_prefer_seg2", hist["p_prefer_seg2"], self.step)
+            self.logger.log("pref/p_tie", hist["p_tie"], self.step)
         
         train_acc = 0
         if self.labeled_feedback > 0:
@@ -163,7 +290,11 @@ class Workspace(object):
                 if total_acc > 0.97:
                     break;
                     
-        print("Reward function is updated!! ACC: " + str(total_acc))
+        # print("Reward function is updated!! ACC: " + str(total_acc))
+        if self.labeled_feedback > 0:
+            print("Reward function is updated!! ACC: " + str(total_acc))
+        else:
+            print("Reward function update skipped (no labeled feedback yet).")
 
     def run(self):
         episode, episode_reward, done = 0, 0, True
@@ -234,7 +365,7 @@ class Workspace(object):
                 self.reward_model.change_batch(frac)
                 
                 # update margin --> not necessary / will be updated soon
-                new_margin = np.mean(avg_train_true_return) * (self.cfg.segment / self.env._max_episode_steps)
+                new_margin = np.mean(avg_train_true_return) * (self.cfg.segment / self.max_episode_steps)
                 self.reward_model.set_teacher_thres_skip(new_margin)
                 self.reward_model.set_teacher_thres_equal(new_margin)
                 
@@ -271,7 +402,7 @@ class Workspace(object):
                         self.reward_model.change_batch(frac)
                         
                         # update margin --> not necessary / will be updated soon
-                        new_margin = np.mean(avg_train_true_return) * (self.cfg.segment / self.env._max_episode_steps)
+                        new_margin = np.mean(avg_train_true_return) * (self.cfg.segment / self.max_episode_steps)
                         self.reward_model.set_teacher_thres_skip(new_margin * self.cfg.teacher_eps_skip)
                         self.reward_model.set_teacher_thres_equal(new_margin * self.cfg.teacher_eps_equal)
                         
@@ -295,7 +426,7 @@ class Workspace(object):
 
             # allow infinite bootstrap
             done = float(done)
-            done_no_max = 0 if episode_step + 1 == self.env._max_episode_steps else done
+            done_no_max = 0 if episode_step + 1 == self.max_episode_steps else done
             episode_reward += reward_hat
             true_episode_reward += reward
             
@@ -316,7 +447,7 @@ class Workspace(object):
         self.agent.save(self.work_dir, self.step)
         self.reward_model.save(self.work_dir, self.step)
         
-@hydra.main(config_path='config', config_name='train_PEBBLE', strict=True)
+@hydra.main(config_path='config', config_name='train_PEBBLE')
 def main(cfg):
     workspace = Workspace(cfg)
     workspace.run()

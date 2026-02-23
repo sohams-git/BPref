@@ -1,3 +1,16 @@
+import distutils
+
+# Ensure distutils.version exists (PyTorch's tensorboard wrapper expects it)
+try:
+    # If stdlib-style distutils is available
+    from distutils import version as _du_version  # type: ignore
+except Exception:
+    # Fall back to setuptools' bundled distutils
+    import setuptools._distutils.version as _du_version  # type: ignore
+    distutils.version = _du_version  # type: ignore[attr-defined]
+
+
+
 from torch.utils.tensorboard import SummaryWriter
 from collections import defaultdict
 import json
@@ -27,7 +40,15 @@ COMMON_EVAL_FORMAT = [
     ('true_episode_reward', 'TR', 'float'),
     ('true_episode_success', 'TS', 'float'),
 ]
-
+PREF_FORMAT = [
+    ('n_total', 'N', 'int'),
+    ('n_prefer_seg1', 'seg1', 'int'),
+    ('n_prefer_seg2', 'seg2', 'int'),
+    ('n_tie', 'tie', 'int'),
+    ('p_prefer_seg1', 'p1', 'float'),
+    ('p_prefer_seg2', 'p2', 'float'),
+    ('p_tie', 'ptie', 'float'),
+]
 
 AGENT_TRAIN_FORMAT = {
     'sac': [
@@ -75,15 +96,37 @@ class MetersGroup(object):
     def log(self, key, value, n=1):
         self._meters[key].update(value, n)
 
+    # def _prime_meters(self):
+    #     data = dict()
+    #     for key, meter in self._meters.items():
+    #         if key.startswith('train'):
+    #             key = key[len('train') + 1:]
+    #         else:
+    #             key = key[len('eval') + 1:]
+    #         key = key.replace('/', '_')
+    #         data[key] = meter.value()
+    #     return data
+    
     def _prime_meters(self):
         data = dict()
         for key, meter in self._meters.items():
-            if key.startswith('train'):
-                key = key[len('train') + 1:]
+            # route key normalization for CSV columns
+            if key.startswith('train/'):
+                k = key[len('train/'):]
+            elif key.startswith('eval/'):
+                k = key[len('eval/'):]
+            elif key.startswith('pref/'):
+                k = key[len('pref/'):]
+            elif key.startswith('train_'):
+                # e.g. train_critic/entropy -> critic/entropy
+                k = key[len('train_'):]
+            elif key.startswith('eval_'):
+                k = key[len('eval_'):]
             else:
-                key = key[len('eval') + 1:]
-            key = key.replace('/', '_')
-            data[key] = meter.value()
+                k = key
+
+            k = k.replace('/', '_')
+            data[k] = meter.value()
         return data
 
     def _dump_to_csv(self, data):
@@ -151,6 +194,8 @@ class Logger(object):
                                      formating=train_format)
         self._eval_mg = MetersGroup(os.path.join(log_dir, 'eval'),
                                     formating=COMMON_EVAL_FORMAT)
+        self._pref_mg = MetersGroup(os.path.join(log_dir, 'pref'),
+                            formating=PREF_FORMAT)
 
     def _should_log(self, step, log_frequency):
         log_frequency = log_frequency or self._log_frequency
@@ -170,14 +215,36 @@ class Logger(object):
         if self._sw is not None:
             self._sw.add_histogram(key, histogram, step)
 
+    # def log(self, key, value, step, n=1, log_frequency=1):
+    #     if not self._should_log(step, log_frequency):
+    #         return
+    #     assert key.startswith('train') or key.startswith('eval')
+    #     if type(value) == torch.Tensor:
+    #         value = value.item()
+    #     self._try_sw_log(key, value / n, step)
+    #     mg = self._train_mg if key.startswith('train') else self._eval_mg
+    #     mg.log(key, value, n)
+
     def log(self, key, value, step, n=1, log_frequency=1):
         if not self._should_log(step, log_frequency):
             return
-        assert key.startswith('train') or key.startswith('eval')
+
+        # Accept train/*, train_*/..., eval/*, eval_*/..., pref/*
+        assert key.startswith(('train', 'eval', 'pref')), f"Bad key: {key}"
+
         if type(value) == torch.Tensor:
             value = value.item()
+
         self._try_sw_log(key, value / n, step)
-        mg = self._train_mg if key.startswith('train') else self._eval_mg
+
+        if key.startswith('pref'):
+            mg = self._pref_mg
+        elif key.startswith('eval'):
+            mg = self._eval_mg
+        else:
+            # anything starting with 'train' goes to train meters group
+            mg = self._train_mg
+
         mg.log(key, value, n)
 
     def log_param(self, key, param, step, log_frequency=None):
@@ -194,7 +261,8 @@ class Logger(object):
     def log_video(self, key, frames, step, log_frequency=None):
         if not self._should_log(step, log_frequency):
             return
-        assert key.startswith('train') or key.startswith('eval')
+        # assert key.startswith('train') or key.startswith('eval')
+        assert key.startswith(('train', 'eval', 'pref'))
         self._try_sw_log_video(key, frames, step)
 
     def log_histogram(self, key, histogram, step, log_frequency=None):
@@ -207,6 +275,7 @@ class Logger(object):
         if ty is None:
             self._train_mg.dump(step, 'train', save)
             self._eval_mg.dump(step, 'eval', save)
+            self._pref_mg.dump(step, 'pref', save)
         elif ty == 'eval':
             self._eval_mg.dump(step, 'eval', save)
         elif ty == 'train':
