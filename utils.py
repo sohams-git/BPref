@@ -81,10 +81,9 @@ def make_env(cfg):
     # ----------------------------
     # 1) WOFOST route (pcse_gym)
     # ----------------------------
-    if isinstance(env_name, str) and env_name == "wofost-lnpkw-v0":
-        # We delegate to bpref.envs.make_env, which knows how to build WofostEnv
+    if isinstance(env_name, str) and env_name.startswith("wofost-"):
         seed = int(getattr(cfg, "seed", 0))
-        env = make_bpref_env("wofost-lnpkw-v0", seed=seed)
+        env = make_bpref_env(env_name, seed=seed)
         return env
     
 
@@ -145,7 +144,7 @@ def make_env(cfg):
 
 def is_wofost(cfg) -> bool:
     env_name = getattr(cfg, "env", "")
-    return isinstance(env_name, str) and env_name == "wofost-lnpkw-v0"
+    return isinstance(env_name, str) and env_name.startswith("wofost-")
 
 
 def to_np(t):

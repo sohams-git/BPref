@@ -18,36 +18,75 @@ from collections import deque
 
 import utils
 import hydra
-
+from hydra.utils import instantiate
 import importlib
 from omegaconf import DictConfig, ListConfig, open_dict  # add this near your other imports
 
 
-def build_agent_from_cfg(agent_cfg: DictConfig):
+# def build_agent_from_cfg(agent_cfg: DictConfig):
+#     """
+#     agent_cfg is expected to look like:
+#       agent:
+#         name: sac
+#         class: agent.sac.SACAgent
+#         params: { ... }
+
+#     Here we:
+#       - import the class from `agent_cfg.class`
+#       - pass `agent_cfg.params` as **kwargs
+
+#     Nested fields like critic_cfg / actor_cfg stay as DictConfig,
+#     so SACAgent can still call hydra.utils.instantiate() on them.
+#     """
+#     cls_path = agent_cfg["class"]
+#     params_cfg = agent_cfg["params"]   # DictConfig
+
+#     module_name, class_name = cls_path.rsplit(".", 1)
+#     mod = importlib.import_module(module_name)
+#     AgentCls = getattr(mod, class_name)
+
+#     # pass DictConfig directly; Hydra instantiate is not used here,
+#     # but SACAgent will use hydra.utils.instantiate on critic_cfg/actor_cfg.
+#     return AgentCls(**params_cfg)
+
+def build_agent(agent_cfg: DictConfig):
     """
-    agent_cfg is expected to look like:
-      agent:
-        name: sac
-        class: agent.sac.SACAgent
-        params: { ... }
-
-    Here we:
-      - import the class from `agent_cfg.class`
-      - pass `agent_cfg.params` as **kwargs
-
-    Nested fields like critic_cfg / actor_cfg stay as DictConfig,
-    so SACAgent can still call hydra.utils.instantiate() on them.
+    Supports:
+      - Hydra style (possibly nested under 'agent')
+      - Custom class/params style
     """
-    cls_path = agent_cfg["class"]
-    params_cfg = agent_cfg["params"]   # DictConfig
 
-    module_name, class_name = cls_path.rsplit(".", 1)
-    mod = importlib.import_module(module_name)
-    AgentCls = getattr(mod, class_name)
+    # Case 1: nested Hydra style (cfg.agent.agent._target_)
+    if "agent" in agent_cfg and isinstance(agent_cfg.agent, DictConfig):
+        inner = agent_cfg.agent
 
-    # pass DictConfig directly; Hydra instantiate is not used here,
-    # but SACAgent will use hydra.utils.instantiate on critic_cfg/actor_cfg.
-    return AgentCls(**params_cfg)
+        if "_target_" in inner:
+            return instantiate(inner, _recursive_=False)
+
+        if "class" in inner:
+            cls_path = inner["class"]
+            params_cfg = inner.get("params", {})
+            module_name, class_name = cls_path.rsplit(".", 1)
+            mod = importlib.import_module(module_name)
+            AgentCls = getattr(mod, class_name)
+            return AgentCls(**params_cfg)
+
+    # Case 2: direct Hydra style (cfg.agent._target_)
+    if "_target_" in agent_cfg:
+        return instantiate(agent_cfg, _recursive_=False)
+
+    # Case 3: direct custom style (cfg.agent.class)
+    if "class" in agent_cfg:
+        cls_path = agent_cfg["class"]
+        params_cfg = agent_cfg.get("params", {})
+        module_name, class_name = cls_path.rsplit(".", 1)
+        mod = importlib.import_module(module_name)
+        AgentCls = getattr(mod, class_name)
+        return AgentCls(**params_cfg)
+
+    raise KeyError(
+        f"Agent config malformed. Top-level keys: {list(agent_cfg.keys())}"
+    )
 
 
 class Workspace(object):
@@ -121,24 +160,45 @@ class Workspace(object):
             action_shape = (action_dim,)
 
         # Write back into config for SACAgent, critic, actor, etc.
-        cfg.agent.params.obs_dim = int(obs_dim)
-        cfg.agent.params.action_dim = int(action_dim)
-        cfg.agent.params.action_range = action_range
+        # cfg.agent.params.obs_dim = int(obs_dim)
+        # cfg.agent.params.action_dim = int(action_dim)
+        # cfg.agent.params.action_range = action_range
 
-        # with open_dict(cfg):
-        #     if "agent" not in cfg or cfg["agent"] is None:
-        #         cfg["agent"] = {}
-        #     if "params" not in cfg["agent"] or cfg["agent"]["params"] is None:
-        #         cfg["agent"]["params"] = {}
+        with open_dict(cfg):
+            # Choose the node that build_agent() will instantiate
+            nested = (
+                hasattr(cfg, "agent")
+                and isinstance(cfg.agent, DictConfig)
+                and "agent" in cfg.agent
+                and isinstance(cfg.agent.agent, DictConfig)
+            )
+            agent_node = cfg.agent.agent if nested else cfg.agent
 
-        #     cfg["agent"]["params"]["obs_dim"] = int(obs_dim)
-        #     cfg["agent"]["params"]["action_dim"] = int(action_dim)
-        #     cfg["agent"]["params"]["action_range"] = action_range
+            # Ensure params exists on the node we actually instantiate
+            if "params" not in agent_node or agent_node.get("params") is None:
+                agent_node["params"] = {}
 
+            agent_node["params"]["obs_dim"] = int(obs_dim)
+            agent_node["params"]["action_dim"] = int(action_dim)
+            agent_node["params"]["action_range"] = action_range
+
+            # ---- IMPORTANT: compat alias for existing interpolations ----
+            # Your critic_cfg/actor_cfg use ${agent.params.obs_dim}, NOT ${agent.agent.params.obs_dim}
+            # So we mirror these keys at cfg.agent.params too.
+            if nested:
+                if "params" not in cfg.agent or cfg.agent.get("params") is None:
+                    cfg.agent["params"] = {}
+                cfg.agent["params"]["obs_dim"] = int(obs_dim)
+                cfg.agent["params"]["action_dim"] = int(action_dim)
+                cfg.agent["params"]["action_range"] = action_range
+
+        from omegaconf import OmegaConf
+        print("cfg.agent:\n", OmegaConf.to_yaml(cfg.agent))
         # -------------------
         # 3) Build agent
         # -------------------
-        self.agent = build_agent_from_cfg(cfg.agent)
+        # self.agent = build_agent_from_cfg(cfg.agent)
+        self.agent = build_agent(cfg.agent)
 
         # -------------------
         # 4) Replay buffer
@@ -181,6 +241,34 @@ class Workspace(object):
             teacher_eps_skip=cfg.teacher_eps_skip,
             teacher_eps_equal=cfg.teacher_eps_equal,
         )
+        print(
+            f"[INIT DBG] obs_dim={obs_dim} action_dim={action_dim} "
+            f"max_episode_steps={self.max_episode_steps} "
+            f"segment={size_segment} activation={cfg.activation}"
+        )
+
+    def debug_replay_reward_stats(self, tag=""):
+        """
+        Print quick stats of rewards currently stored in replay buffer.
+        Works for the standard ReplayBuffer layout used here.
+        """
+        try:
+            max_idx = self.replay_buffer.idx if not self.replay_buffer.full else self.replay_buffer.capacity
+            if max_idx == 0:
+                print(f"[REPLAY DBG] {tag} replay empty")
+                return
+
+            rew = self.replay_buffer.rewards[:max_idx]
+            rew = np.asarray(rew).reshape(-1)
+
+            print(
+                f"[REPLAY DBG] {tag} "
+                f"n={len(rew)} "
+                f"mean={rew.mean():.6f} std={rew.std():.6f} "
+                f"min={rew.min():.6f} max={rew.max():.6f}"
+            )
+        except Exception as e:
+            print(f"[REPLAY DBG] {tag} failed: {e}")
 
     def evaluate(self):
         average_episode_reward = 0
@@ -324,6 +412,14 @@ class Workspace(object):
                 self.logger.log('train/true_episode_reward', true_episode_reward, self.step)
                 self.logger.log('train/total_feedback', self.total_feedback, self.step)
                 self.logger.log('train/labeled_feedback', self.labeled_feedback, self.step)
+
+                print(
+                    f"[EPISODE DBG] episode={episode} step={self.step} "
+                    f"pred_return={float(episode_reward):.6f} "
+                    f"true_return={float(true_episode_reward):.6f} "
+                    f"total_feedback={self.total_feedback} "
+                    f"labeled_feedback={self.labeled_feedback}"
+                )
                 
                 if self.log_success:
                     self.logger.log('train/episode_success', episode_success,
@@ -371,9 +467,13 @@ class Workspace(object):
                 
                 # first learn reward
                 self.learn_reward(first_flag=1)
+
+                self.debug_replay_reward_stats(tag="before first relabel")
                 
                 # relabel buffer
                 self.replay_buffer.relabel_with_predictor(self.reward_model)
+
+                self.debug_replay_reward_stats(tag="after first relabel")
                 
                 # reset Q due to unsuperivsed exploration
                 self.agent.reset_critic()
@@ -411,10 +511,15 @@ class Workspace(object):
                             self.reward_model.set_batch(self.cfg.max_feedback - self.total_feedback)
                             
                         self.learn_reward()
+
+                        self.debug_replay_reward_stats(tag=f"before relabel step={self.step}")
                         self.replay_buffer.relabel_with_predictor(self.reward_model)
+                        self.debug_replay_reward_stats(tag=f"after relabel step={self.step}")
                         interact_count = 0
                         
                 self.agent.update(self.replay_buffer, self.logger, self.step, 1)
+                if self.step % 500 == 0:
+                    self.debug_replay_reward_stats(tag=f"post-agent-update step={self.step}")
                 
             # unsupervised exploration
             elif self.step > self.cfg.num_seed_steps:
@@ -422,8 +527,29 @@ class Workspace(object):
                                             gradient_update=1, K=self.cfg.topK)
                 
             next_obs, reward, done, extra = self.env.step(action)
-            reward_hat = self.reward_model.r_hat(np.concatenate([obs, action], axis=-1))
 
+            sa = np.concatenate([obs, action], axis=-1).astype(np.float32)
+            reward_hat_arr = self.reward_model.r_hat(sa)
+            reward_hat = float(np.asarray(reward_hat_arr).reshape(-1)[0])
+
+            if self.step % 500 == 0:
+                print(
+                    f"[STEP DBG] step={self.step} "
+                    f"env_reward={float(reward):.6f} "
+                    f"r_hat={reward_hat:.6f} "
+                    f"done={done}"
+                )
+
+                try:
+                    print(
+                        f"[NORM DBG] count={self.reward_model.norm_count} "
+                        f"mean_abs_mean={np.mean(np.abs(self.reward_model.norm_mean)):.6f} "
+                        f"mean_std={np.mean(self.reward_model.norm_std):.6f} "
+                        f"min_std={np.min(self.reward_model.norm_std):.6f} "
+                        f"max_std={np.max(self.reward_model.norm_std):.6f}"
+                    )
+                except Exception as e:
+                    print(f"[NORM DBG] failed: {e}")
             # allow infinite bootstrap
             done = float(done)
             done_no_max = 0 if episode_step + 1 == self.max_episode_steps else done

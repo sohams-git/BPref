@@ -268,3 +268,64 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref/runs/full_walker2d_s1 \
+#   --env gym-walker2d \
+#   --actor_step 1000000 \
+#   --rm_step 1000000 \
+#   --episodes 20 \
+#   --device cpu
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref/runs/full_swimmer_s3 \
+#   --env gym-walker2d \
+#   --actor_step 1000000 \
+#   --rm_step 1000000 \
+#   --episodes 20 \
+#   --device cpu
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref/runs/full_ant_s1 \
+#   --episodes 50 \
+#   --device cuda
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref/runs/full_reacher_s0 \
+#   --episodes 50 \
+#   --device cuda
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref/runs/reacher_seg10_s1 \
+#   --episodes 50 \
+#   --device cuda
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref/runs/full_swimmer_s0 \
+#   --episodes 20 \
+#   --device cpu
+
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref-main/runs/full_walker2d_s3 \
+#   --episodes 50 \
+#   --device cuda
+# /home/sohams/BPref-main/runs/full_walker2d_s3
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref/runs/hopper/pebble_hopper_b2000_seg50_s2 \
+#   --episodes 30 \
+#   --device cpu
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref-main/runs/full_humanoid_s0 \
+#   --episodes 50 \
+#   --device cuda
+
+# /home/sohams/BPref/runs/halfcheetah/pebble_uniformS_gpu_seed2
+
+# python eval_bpref_any_env.py \
+#   --run_dir /home/sohams/BPref/runs/halfcheetah/pebble_uniformS_gpu_seed2\
+#   --episodes 50 \
+#   --device cuda

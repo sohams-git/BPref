@@ -1,0 +1,31 @@
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+/home/sohams/BPref/train_PEBBLE.py:576: UserWarning: 
+The version_base parameter is not specified.
+Please specify a compatability version level, or None.
+Will assume defaults for version 1.1
+  @hydra.main(config_path='config', config_name='train_PEBBLE')
+/home/sohams/anaconda3/envs/bpref-wofost/lib/python3.12/site-packages/hydra/_internal/defaults_list.py:251: UserWarning: In 'train_PEBBLE': Defaults list is missing `_self_`. See https://hydra.cc/docs/1.2/upgrades/1.0_to_1.1/default_composition_order for more information
+  warnings.warn(msg, UserWarning)
+/home/sohams/anaconda3/envs/bpref-wofost/lib/python3.12/site-packages/hydra/_internal/hydra.py:119: UserWarning: Future Hydra versions will no longer change working directory at job runtime by default.
+See https://hydra.cc/docs/1.2/upgrades/1.1_to_1.2/changes_to_job_working_dir/ for more information.
+  ret = run_job(
+workspace: /home/sohams/BPref/exp/wofost-lw-v0/PEBBLE_maxfeed256_seg365_seed0
+Error executing job with overrides: ['env=wofost-lw-v0', 'wofost.enable_tier2=true', 'activation=linear', 'segment=365', 'num_train_steps=12000', 'num_seed_steps=3000', 'num_unsup_steps=0', 'num_interact=300', 'max_feedback=256', 'reward_update=5', 'reward_batch=32', 'log_frequency=200', 'eval_frequency=1000000', 'seed=0']
+Traceback (most recent call last):
+  File "/home/sohams/BPref/train_PEBBLE.py", line 578, in main
+    workspace = Workspace(cfg)
+                ^^^^^^^^^^^^^^
+  File "/home/sohams/BPref/train_PEBBLE.py", line 126, in __init__
+    self.env = utils.make_env(cfg)
+               ^^^^^^^^^^^^^^^^^^^
+  File "/home/sohams/BPref/utils.py", line 138, in make_env
+    env = dmc2gym.make(
+          ^^^^^^^^^^^^^
+  File "/home/sohams/BPref/dmc2gym/__init__.py", line 2, in make
+    raise RuntimeError("dmc2gym stub accessed; this is a Gym-only run.")
+RuntimeError: dmc2gym stub accessed; this is a Gym-only run.
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

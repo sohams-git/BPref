@@ -42,8 +42,11 @@ def make_env(env_name, **kwargs):
             return GymMujocoEnv(env_id=gym_id, **kwargs)
 
     # WOFOST branch (optional)
-    if env_name == "wofost-lnpkw-v0":
+    # if env_name == "wofost-lnpkw-v0":
+    #     from .wofost_env import WofostEnv
+    #     return WofostEnv(env_id="lnpkw-v0", **kwargs)
+    if env_name.startswith("wofost-"):
         from .wofost_env import WofostEnv
-        return WofostEnv(env_id="lnpkw-v0", **kwargs)
-
+        env_id = env_name.replace("wofost-", "", 1)
+        return WofostEnv(env_id=env_id, **kwargs)
     raise ValueError(f"Unknown env_name: {env_name}")

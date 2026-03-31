@@ -15,19 +15,40 @@ from scipy.stats import norm
 
 device = 'cuda'
 
+# def gen_net(in_size=1, out_size=1, H=128, n_layers=3, activation='tanh'):
+#     net = []
+#     for i in range(n_layers):
+#         net.append(nn.Linear(in_size, H))
+#         net.append(nn.LeakyReLU())
+#         in_size = H
+#     net.append(nn.Linear(in_size, out_size))
+#     if activation == 'tanh':
+#         net.append(nn.Tanh())
+#     elif activation == 'sig':
+#         net.append(nn.Sigmoid())
+#     else:
+#         net.append(nn.ReLU())
+
+#     return net
+
 def gen_net(in_size=1, out_size=1, H=128, n_layers=3, activation='tanh'):
     net = []
     for i in range(n_layers):
         net.append(nn.Linear(in_size, H))
         net.append(nn.LeakyReLU())
         in_size = H
+
     net.append(nn.Linear(in_size, out_size))
+
+    # Output activation
     if activation == 'tanh':
         net.append(nn.Tanh())
     elif activation == 'sig':
         net.append(nn.Sigmoid())
+    elif activation in ['linear', 'none', None]:
+        pass
     else:
-        net.append(nn.ReLU())
+        raise ValueError(f"Unknown activation: {activation}")
 
     return net
 
@@ -145,6 +166,13 @@ class RewardModel:
         #   1 => prefer seg2
         #  -1 => tie
         self.last_label_hist = None
+        # ---- input normalization stats for state-action ----
+        self.in_dim = self.ds + self.da
+        self.norm_count = 0
+        self.norm_mean = np.zeros(self.in_dim, dtype=np.float32)
+        self.norm_M2 = np.zeros(self.in_dim, dtype=np.float32)
+        self.norm_std = np.ones(self.in_dim, dtype=np.float32)
+        self.norm_eps = 1e-6
     
     def softXEnt_loss(self, input, target):
         logprobs = torch.nn.functional.log_softmax (input, dim = 1)
@@ -171,12 +199,54 @@ class RewardModel:
             self.paramlst.extend(model.parameters())
             
         self.opt = torch.optim.Adam(self.paramlst, lr = self.lr)
+
+    def _update_input_stats(self, x):
+        """
+        Update running mean/std using Welford's algorithm.
+        x: shape (D,) or (N, D)
+        """
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[None, :]
+
+        for row in x:
+            self.norm_count += 1
+            delta = row - self.norm_mean
+            self.norm_mean += delta / self.norm_count
+            delta2 = row - self.norm_mean
+            self.norm_M2 += delta * delta2
+
+        if self.norm_count > 1:
+            var = self.norm_M2 / (self.norm_count - 1)
+            var = np.maximum(var, self.norm_eps)
+            self.norm_std = np.sqrt(var).astype(np.float32)
+
+    def _normalize_input(self, x):
+        """
+        Normalize state-action input using running mean/std.
+        x: shape (D,) or (N, D) or (B, T, D)
+        """
+        x = np.asarray(x, dtype=np.float32)
+
+        if self.norm_count < 2:
+            return x
+
+        return (x - self.norm_mean) / (self.norm_std + self.norm_eps)
             
     def add_data(self, obs, act, rew, done):
+        # sa_t = np.concatenate([obs, act], axis=-1)
+        # r_t = rew
+        
+        # flat_input = sa_t.reshape(1, self.da+self.ds)
+        # r_t = np.array(r_t)
+        # flat_target = r_t.reshape(1, 1)
+
         sa_t = np.concatenate([obs, act], axis=-1)
         r_t = rew
-        
-        flat_input = sa_t.reshape(1, self.da+self.ds)
+
+        flat_input = sa_t.reshape(1, self.da + self.ds).astype(np.float32)
+        self._update_input_stats(flat_input)
+
         r_t = np.array(r_t)
         flat_target = r_t.reshape(1, 1)
 
@@ -229,8 +299,11 @@ class RewardModel:
         with torch.no_grad():
             r_hat1 = self.r_hat_member(x_1, member=member)
             r_hat2 = self.r_hat_member(x_2, member=member)
-            r_hat1 = r_hat1.sum(axis=1)
-            r_hat2 = r_hat2.sum(axis=1)
+            # r_hat1 = r_hat1.sum(axis=1)
+            # r_hat2 = r_hat2.sum(axis=1)
+            r_hat1 = r_hat1.mean(axis=1)
+            r_hat2 = r_hat2.mean(axis=1)
+
             r_hat = torch.cat([r_hat1, r_hat2], axis=-1)
         
         # taking 0 index for probability x_1 > x_2
@@ -241,26 +314,55 @@ class RewardModel:
         with torch.no_grad():
             r_hat1 = self.r_hat_member(x_1, member=member)
             r_hat2 = self.r_hat_member(x_2, member=member)
-            r_hat1 = r_hat1.sum(axis=1)
-            r_hat2 = r_hat2.sum(axis=1)
+            # r_hat1 = r_hat1.sum(axis=1)
+            # r_hat2 = r_hat2.sum(axis=1)
+            r_hat1 = r_hat1.mean(axis=1)
+            r_hat2 = r_hat2.mean(axis=1)
             r_hat = torch.cat([r_hat1, r_hat2], axis=-1)
         
         ent = F.softmax(r_hat, dim=-1) * F.log_softmax(r_hat, dim=-1)
         ent = ent.sum(axis=-1).abs()
         return ent
 
+    # def r_hat_member(self, x, member=-1):
+    #     # the network parameterizes r hat in eqn 1 from the paper
+    #     return self.ensemble[member](torch.from_numpy(x).float().to(device))
+
     def r_hat_member(self, x, member=-1):
-        # the network parameterizes r hat in eqn 1 from the paper
-        return self.ensemble[member](torch.from_numpy(x).float().to(device))
+        # normalize input before reward prediction
+        x = self._normalize_input(x)
+        x_t = torch.from_numpy(np.asarray(x, dtype=np.float32)).float().to(device)
+        return self.ensemble[member](x_t)
+
+    # def r_hat(self, x):
+    #     # they say they average the rewards from each member of the ensemble, but I think this only makes sense if the rewards are already normalized
+    #     # but I don't understand how the normalization should be happening right now :(
+    #     r_hats = []
+    #     for member in range(self.de):
+    #         r_hats.append(self.r_hat_member(x, member=member).detach().cpu().numpy())
+    #     r_hats = np.array(r_hats)
+    #     return np.mean(r_hats)
 
     def r_hat(self, x):
-        # they say they average the rewards from each member of the ensemble, but I think this only makes sense if the rewards are already normalized
-        # but I don't understand how the normalization should be happening right now :(
+        """
+        Returns predicted reward per state-action.
+        Input:
+        x: (ds+da,) or (B, ds+da)
+        Output:
+        (B, 1) numpy array
+        """
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[None, :]
+
         r_hats = []
         for member in range(self.de):
-            r_hats.append(self.r_hat_member(x, member=member).detach().cpu().numpy())
-        r_hats = np.array(r_hats)
-        return np.mean(r_hats)
+            # (B, 1) torch -> numpy
+            r = self.r_hat_member(x, member=member).detach().cpu().numpy()
+            r_hats.append(r)
+
+        r_hats = np.stack(r_hats, axis=0)  # (E, B, 1)
+        return np.mean(r_hats, axis=0)     # (B, 1)
     
     def r_hat_batch(self, x):
         # they say they average the rewards from each member of the ensemble, but I think this only makes sense if the rewards are already normalized
@@ -306,8 +408,10 @@ class RewardModel:
                 # get logits
                 r_hat1 = self.r_hat_member(sa_t_1, member=member)
                 r_hat2 = self.r_hat_member(sa_t_2, member=member)
-                r_hat1 = r_hat1.sum(axis=1)
-                r_hat2 = r_hat2.sum(axis=1)
+                # r_hat1 = r_hat1.sum(axis=1)
+                # r_hat2 = r_hat2.sum(axis=1)
+                r_hat1 = r_hat1.mean(axis=1)
+                r_hat2 = r_hat2.mean(axis=1)
                 r_hat = torch.cat([r_hat1, r_hat2], axis=-1)                
                 _, predicted = torch.max(r_hat.data, 1)
                 correct = (predicted == labels).sum().item()
@@ -460,6 +564,17 @@ class RewardModel:
     def get_label(self, sa_t_1, sa_t_2, r_t_1, r_t_2):
         sum_r_t_1 = np.sum(r_t_1, axis=1)
         sum_r_t_2 = np.sum(r_t_2, axis=1)
+        if not hasattr(self, "debug_pref_round"):
+            self.debug_pref_round = 0
+        self.debug_pref_round += 1
+
+        if self.debug_pref_round <= 5:
+            print("\n[DEBUG PREF DATASET]")
+            for i in range(min(5, len(sum_r_t_1))):
+                ret1 = float(sum_r_t_1[i])
+                ret2 = float(sum_r_t_2[i])
+                diff = ret1 - ret2
+                print(f"pair {i}: ret1={ret1:.4f}, ret2={ret2:.4f}, diff={diff:.4f}")
         
         # skip the query
         if self.teacher_thres_skip > 0: 
@@ -506,6 +621,8 @@ class RewardModel:
  
         # equally preferable
         labels[margin_index] = -1 
+        if self.debug_pref_round <= 5:
+            print("labels sample:", labels[:min(5, len(labels))].reshape(-1).tolist())
 
         # ---- store label distribution for logging (per round) ----
         # labels are in {-1,0,1} where:
@@ -764,6 +881,10 @@ class RewardModel:
     
     def train_reward(self):
         ensemble_losses = [[] for _ in range(self.de)]
+        if not hasattr(self, "debug_train_reward_calls"):
+            self.debug_train_reward_calls = 0
+        self.debug_train_reward_calls += 1
+        debug_this_call = self.debug_train_reward_calls <= 3
         ensemble_acc = np.array([0 for _ in range(self.de)])
         
         max_len = self.capacity if self.buffer_full else self.buffer_index
@@ -798,9 +919,20 @@ class RewardModel:
                 # get logits
                 r_hat1 = self.r_hat_member(sa_t_1, member=member)
                 r_hat2 = self.r_hat_member(sa_t_2, member=member)
-                r_hat1 = r_hat1.sum(axis=1)
-                r_hat2 = r_hat2.sum(axis=1)
+                # r_hat1 = r_hat1.sum(axis=1)
+                # r_hat2 = r_hat2.sum(axis=1)
+                r_hat1 = r_hat1.mean(axis=1)
+                r_hat2 = r_hat2.mean(axis=1)
                 r_hat = torch.cat([r_hat1, r_hat2], axis=-1)
+                if debug_this_call and member == 0 and epoch < 2:
+                    print("[RM SCORE DEBUG | train_reward]")
+                    for j in range(min(5, r_hat1.shape[0])):
+                        print(
+                            f"pair {j}: "
+                            f"score1={float(r_hat1[j].item()):.4f}, "
+                            f"score2={float(r_hat2[j].item()):.4f}, "
+                            f"label={int(labels[j].item())}"
+                        )
 
                 # compute loss
                 curr_loss = self.CEloss(r_hat, labels)
@@ -813,6 +945,24 @@ class RewardModel:
                 ensemble_acc[member] += correct
                 
             loss.backward()
+
+            total_grad_norm = 0.0
+            num_params_with_grad = 0
+            for p in self.paramlst:
+                if p.grad is not None:
+                    g = p.grad.data.norm(2).item()
+                    total_grad_norm += g * g
+                    num_params_with_grad += 1
+            total_grad_norm = total_grad_norm ** 0.5
+
+            if debug_this_call:
+                print(
+                    f"[RM TRAIN | train_reward] "
+                    f"epoch={epoch} loss={float(loss.item()):.6f} "
+                    f"grad_norm={total_grad_norm:.6e} "
+                    f"params_with_grad={num_params_with_grad}"
+                )
+
             self.opt.step()
         
         ensemble_acc = ensemble_acc / total
@@ -821,6 +971,10 @@ class RewardModel:
     
     def train_soft_reward(self):
         ensemble_losses = [[] for _ in range(self.de)]
+        if not hasattr(self, "debug_train_soft_calls"):
+            self.debug_train_soft_calls = 0
+        self.debug_train_soft_calls += 1
+        debug_this_call = self.debug_train_soft_calls <= 3
         ensemble_acc = np.array([0 for _ in range(self.de)])
         
         max_len = self.capacity if self.buffer_full else self.buffer_index
@@ -855,9 +1009,20 @@ class RewardModel:
                 # get logits
                 r_hat1 = self.r_hat_member(sa_t_1, member=member)
                 r_hat2 = self.r_hat_member(sa_t_2, member=member)
-                r_hat1 = r_hat1.sum(axis=1)
-                r_hat2 = r_hat2.sum(axis=1)
+                # r_hat1 = r_hat1.sum(axis=1)
+                # r_hat2 = r_hat2.sum(axis=1)
+                r_hat1 = r_hat1.mean(axis=1)
+                r_hat2 = r_hat2.mean(axis=1)
                 r_hat = torch.cat([r_hat1, r_hat2], axis=-1)
+                if debug_this_call and member == 0 and epoch < 2:
+                    print("[RM SCORE DEBUG | train_soft_reward]")
+                    for j in range(min(5, r_hat1.shape[0])):
+                        print(
+                            f"pair {j}: "
+                            f"score1={float(r_hat1[j].item()):.4f}, "
+                            f"score2={float(r_hat2[j].item()):.4f}, "
+                            f"label={int(labels[j].item())}"
+                        )
 
                 # compute loss
                 uniform_index = labels == -1
@@ -876,6 +1041,24 @@ class RewardModel:
                 ensemble_acc[member] += correct
                 
             loss.backward()
+
+            total_grad_norm = 0.0
+            num_params_with_grad = 0
+            for p in self.paramlst:
+                if p.grad is not None:
+                    g = p.grad.data.norm(2).item()
+                    total_grad_norm += g * g
+                    num_params_with_grad += 1
+            total_grad_norm = total_grad_norm ** 0.5
+
+            if debug_this_call:
+                print(
+                    f"[RM TRAIN | train_soft_reward] "
+                    f"epoch={epoch} loss={float(loss.item()):.6f} "
+                    f"grad_norm={total_grad_norm:.6e} "
+                    f"params_with_grad={num_params_with_grad}"
+                )
+
             self.opt.step()
         
         ensemble_acc = ensemble_acc / total
