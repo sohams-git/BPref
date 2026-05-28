@@ -168,11 +168,19 @@ class RewardModel:
         self.last_label_hist = None
         # ---- input normalization stats for state-action ----
         self.in_dim = self.ds + self.da
+        self.norm_eps = 1e-6
         self.norm_count = 0
         self.norm_mean = np.zeros(self.in_dim, dtype=np.float32)
         self.norm_M2 = np.zeros(self.in_dim, dtype=np.float32)
         self.norm_std = np.ones(self.in_dim, dtype=np.float32)
-        self.norm_eps = 1e-6
+
+        # ---- reward (output) normalization stats ----
+        self.rew_count = 0
+        self.rew_mean = 0.0
+        self.rew_M2 = 0.0
+        self.rew_var = 1.0
+        self.rew_std = 1.0
+        self.rew_clip = 5.0
     
     def softXEnt_loss(self, input, target):
         logprobs = torch.nn.functional.log_softmax (input, dim = 1)
@@ -232,6 +240,64 @@ class RewardModel:
             return x
 
         return (x - self.norm_mean) / (self.norm_std + self.norm_eps)
+
+    def _update_reward_stats(self, r):
+        """
+        Update reward running mean/std.
+        r: shape (N, 1) or (N,)
+        """
+        r = np.asarray(r, dtype=np.float32).flatten()
+        if len(r) == 0: return
+
+        for val in r:
+            self.rew_count += 1
+            delta = val - self.rew_mean
+            self.rew_mean += delta / self.rew_count
+            delta2 = val - self.rew_mean
+            self.rew_M2 += delta * delta2
+
+        if self.rew_count > 1:
+            self.rew_var = self.rew_M2 / (self.rew_count - 1)
+            self.rew_var = np.maximum(self.rew_var, 1e-4) # clip to avoid zero
+            self.rew_std = np.sqrt(self.rew_var)
+
+    def _normalize_reward(self, r):
+        """
+        Standardize reward output using frozen running stats.
+        """
+        r = np.asarray(r, dtype=np.float32)
+
+        if self.rew_count < 10:
+            # Fallback before stats are ready: just bound it
+            return np.clip(r, -self.rew_clip, self.rew_clip)
+
+        # Standardize
+        r = (r - self.rew_mean) / (self.rew_std + 1e-8)
+        # Final clip to bound signal for SAC
+        return np.clip(r, -self.rew_clip, self.rew_clip)
+
+    def update_statistics(self):
+        """
+        Recalculate reward statistics using current ensemble on segments in the preference buffer.
+        This makes the normalization 'active' and grounded in recent model outputs.
+        """
+        max_len = self.capacity if self.buffer_full else self.buffer_index
+        if max_len == 0:
+            return
+
+        # Use both segments from the buffer to get a good distribution of predicted rewards
+        all_rewards = []
+        # Sample a subset if buffer is huge, but here let's just use all for precision
+        for member in range(self.de):
+            r1 = self.r_hat_member(self.buffer_seg1[:max_len], member=member).detach().cpu().numpy() # (N, T, 1)
+            r2 = self.r_hat_member(self.buffer_seg2[:max_len], member=member).detach().cpu().numpy() # (N, T, 1)
+            all_rewards.append(r1)
+            all_rewards.append(r2)
+        
+        all_rewards = np.concatenate(all_rewards, axis=0) # (2*de*N, T, 1)
+        self._update_reward_stats(all_rewards)
+        
+        print(f"[RM STATS] Statistics updated: count={self.rew_count} mean={self.rew_mean:.4f} std={self.rew_std:.4f}")
             
     def add_data(self, obs, act, rew, done):
         # sa_t = np.concatenate([obs, act], axis=-1)
@@ -334,6 +400,20 @@ class RewardModel:
         x_t = torch.from_numpy(np.asarray(x, dtype=np.float32)).float().to(device)
         return self.ensemble[member](x_t)
 
+    def _predict_raw_reward(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[None, :]
+
+        r_hats = []
+        for member in range(self.de):
+            r = self.r_hat_member(x, member=member).detach().cpu().numpy()
+            r_hats.append(r)
+
+        r_hats = np.stack(r_hats, axis=0)   # (E, B, 1)
+        mean_r = np.mean(r_hats, axis=0)    # (B, 1)
+        return mean_r
+
     # def r_hat(self, x):
     #     # they say they average the rewards from each member of the ensemble, but I think this only makes sense if the rewards are already normalized
     #     # but I don't understand how the normalization should be happening right now :(
@@ -345,34 +425,23 @@ class RewardModel:
 
     def r_hat(self, x):
         """
-        Returns predicted reward per state-action.
-        Input:
-        x: (ds+da,) or (B, ds+da)
-        Output:
-        (B, 1) numpy array
+        Predict reward using frozen normalization stats.
+        Do NOT update running reward stats here.
         """
-        x = np.asarray(x, dtype=np.float32)
-        if x.ndim == 1:
-            x = x[None, :]
-
-        r_hats = []
-        for member in range(self.de):
-            # (B, 1) torch -> numpy
-            r = self.r_hat_member(x, member=member).detach().cpu().numpy()
-            r_hats.append(r)
-
-        r_hats = np.stack(r_hats, axis=0)  # (E, B, 1)
-        return np.mean(r_hats, axis=0)     # (B, 1)
+        mean_r = self._predict_raw_reward(x)
+        norm_r = self._normalize_reward(mean_r)
+        norm_r = np.clip(norm_r, -self.rew_clip, self.rew_clip)
+        return norm_r
     
     def r_hat_batch(self, x):
-        # they say they average the rewards from each member of the ensemble, but I think this only makes sense if the rewards are already normalized
-        # but I don't understand how the normalization should be happening right now :(
         r_hats = []
         for member in range(self.de):
             r_hats.append(self.r_hat_member(x, member=member).detach().cpu().numpy())
         r_hats = np.array(r_hats)
-
-        return np.mean(r_hats, axis=0)
+        mean_r = np.mean(r_hats, axis=0)
+        
+        norm_r = self._normalize_reward(mean_r)
+        return np.clip(norm_r, -self.rew_clip, self.rew_clip)
     
     def save(self, model_dir, step):
         for member in range(self.de):
@@ -481,6 +550,23 @@ class RewardModel:
                 
     #     return sa_t_1, sa_t_2, r_t_1, r_t_2
 
+    def _compute_segment_stage(self, sa_seg):
+        # sa_seg is (segment_length, ds + da)
+        # For wofost-lw-v0, DVS is at index 1 of the state vector.
+        # Environment normalizes DVS to [-1, 1] via: obs = (DVS - low) / (high - low) * 2 - 1
+        # Typically low=0, high=2, so obs = DVS - 1.
+        dvs_val = np.mean(sa_seg[:, 1])
+        
+        # DVS < 0  => Germinating (obs < -1)
+        # 0 < DVS < 1 => Vegetative (-1 < obs < 0)
+        # 1 < DVS < 2 => Reproductive (0 < obs < 1)
+        # DVS > 2 => Mature (obs > 1)
+        
+        if dvs_val <= -1.0: return 0      # Emerging
+        elif dvs_val < 0.0: return 1   # Vegetative
+        elif dvs_val < 1.0: return 2   # Reproductive
+        else: return 3                 # Mature
+
     def get_queries(self, mb_size=20):
         seg = int(self.size_segment)
 
@@ -518,23 +604,85 @@ class RewardModel:
         r_t_2  = np.empty((mb_size, seg, 1), dtype=np.float32)
 
         n = len(valid)
-        for i in range(mb_size):
+        pairs_found = 0
+        n_skipped = 0
+        fallback_pairs = 0
+        natural_pairs = 0
+        
+        stage_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        
+        max_attempts = mb_size * 200
+        attempts = 0
+        
+        while pairs_found < mb_size and attempts < max_attempts:
+            attempts += 1
             idx1 = np.random.randint(0, n)
             idx2 = np.random.randint(0, n)
 
             sa1, rr1 = valid[idx1]
             sa2, rr2 = valid[idx2]
 
-            T1 = len(sa1)
-            T2 = len(sa2)
+            s1 = np.random.randint(0, len(sa1) - seg + 1)
+            s2 = np.random.randint(0, len(sa2) - seg + 1)
 
-            s1 = np.random.randint(0, T1 - seg + 1)
-            s2 = np.random.randint(0, T2 - seg + 1)
+            seg1_sa = sa1[s1:s1 + seg]
+            seg2_sa = sa2[s2:s2 + seg]
+            
+            stage1 = self._compute_segment_stage(seg1_sa)
+            stage2 = self._compute_segment_stage(seg2_sa)
+            
+            if stage1 == stage2:
+                sa_t_1[pairs_found] = seg1_sa
+                sa_t_2[pairs_found] = seg2_sa
+                r_t_1[pairs_found]  = rr1[s1:s1 + seg]
+                r_t_2[pairs_found]  = rr2[s2:s2 + seg]
+                stage_counts[stage1] += 2  # Each valid pair adds 2 segments to this stage
+                pairs_found += 1
+            else:
+                n_skipped += 1
 
-            sa_t_1[i] = sa1[s1:s1 + seg]
-            sa_t_2[i] = sa2[s2:s2 + seg]
-            r_t_1[i]  = rr1[s1:s1 + seg]
-            r_t_2[i]  = rr2[s2:s2 + seg]
+        natural_pairs = pairs_found
+
+        # Strict Fallback: We mathematically guarantee stage(seg1) == stage(seg2)
+        # by replicating a single segment to itself to pad out the batch without violating the rule.
+        if pairs_found < mb_size:
+            print(f"[STAGE-ALIGNED DBG] WARNING: Not enough distinct same-stage pairs found after {max_attempts} attempts. Padding remaining {mb_size - pairs_found} slot(s) with identical segment copies.")
+            while pairs_found < mb_size:
+                idx1 = np.random.randint(0, n)
+                sa1, rr1 = valid[idx1]
+
+                s1 = np.random.randint(0, len(sa1) - seg + 1)
+                seg1_sa = sa1[s1:s1 + seg]
+                
+                # Explicit enforce
+                stage1 = self._compute_segment_stage(seg1_sa)
+                
+                # Self-copy directly enforces mathematically perfectly identical stages
+                sa_t_1[pairs_found] = seg1_sa
+                sa_t_2[pairs_found] = seg1_sa
+                r_t_1[pairs_found]  = rr1[s1:s1 + seg]
+                r_t_2[pairs_found]  = rr1[s1:s1 + seg]
+                
+                stage_counts[stage1] += 2
+                pairs_found += 1
+                fallback_pairs += 1
+
+        print(f"[STAGE-ALIGNED DBG] Pairs gathered: {mb_size}. Natural: {natural_pairs}, Fallback: {fallback_pairs}, Randomly skipped attempts: {n_skipped}. "
+              f"Segments per stage -> "
+              f"Emerging:{stage_counts.get(0, 0)} Veg:{stage_counts.get(1, 0)} "
+              f"Repro:{stage_counts.get(2, 0)} Mature:{stage_counts.get(3, 0)}")
+
+        # Randomly swap order of pairs to remove positional bias
+        for i in range(mb_size):
+            if np.random.rand() > 0.5:
+                # swap sa
+                tmp_sa = sa_t_1[i].copy()
+                sa_t_1[i] = sa_t_2[i]
+                sa_t_2[i] = tmp_sa
+                # swap r (true rewards from teacher)
+                tmp_r = r_t_1[i].copy()
+                r_t_1[i] = r_t_2[i]
+                r_t_2[i] = tmp_r
 
         return sa_t_1, sa_t_2, r_t_1, r_t_2
 
@@ -963,9 +1111,12 @@ class RewardModel:
                     f"params_with_grad={num_params_with_grad}"
                 )
 
-            self.opt.step()
+        self.opt.step()
         
         ensemble_acc = ensemble_acc / total
+        
+        # Update normalization stats after training has changed the reward scale
+        self.update_statistics()
         
         return ensemble_acc
     
@@ -1059,8 +1210,11 @@ class RewardModel:
                     f"params_with_grad={num_params_with_grad}"
                 )
 
-            self.opt.step()
+        self.opt.step()
         
         ensemble_acc = ensemble_acc / total
+        
+        # Update normalization stats after training has changed the reward scale
+        self.update_statistics()
         
         return ensemble_acc

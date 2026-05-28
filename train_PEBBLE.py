@@ -285,8 +285,11 @@ class Workspace(object):
                 episode_success = 0
 
             while not done:
-                with utils.eval_mode(self.agent):
-                    action = self.agent.act(obs, sample=False)
+                if self.cfg.get('diagRM', False):
+                    action = self.env.action_space.sample()
+                else:
+                    with utils.eval_mode(self.agent):
+                        action = self.agent.act(obs, sample=False)
                 obs, reward, done, extra = self.env.step(action)
                 
                 episode_reward += reward
@@ -395,6 +398,13 @@ class Workspace(object):
         start_time = time.time()
 
         interact_count = 0
+        if self.cfg.get('diagRM', False):
+            print("\n" + "="*50)
+            print("[MODE] DIAGNOSTIC: Reward Model Training ONLY")
+            print("       - SAC updates fully disabled")
+            print("       - Policy actions overridden by random sampling")
+            print("="*50 + "\n")
+
         while self.step < self.cfg.num_train_steps:
             if done:
                 if self.step > 0:
@@ -441,7 +451,7 @@ class Workspace(object):
                 self.logger.log('train/episode', episode, self.step)
                         
             # sample action for data collection
-            if self.step < self.cfg.num_seed_steps:
+            if self.step < self.cfg.num_seed_steps or self.cfg.get('diagRM', False):
                 action = self.env.action_space.sample()
             else:
                 with utils.eval_mode(self.agent):
@@ -476,13 +486,14 @@ class Workspace(object):
                 self.debug_replay_reward_stats(tag="after first relabel")
                 
                 # reset Q due to unsuperivsed exploration
-                self.agent.reset_critic()
-                
-                # update agent
-                self.agent.update_after_reset(
-                    self.replay_buffer, self.logger, self.step, 
-                    gradient_update=self.cfg.reset_update, 
-                    policy_update=True)
+                if not self.cfg.get('diagRM', False):
+                    self.agent.reset_critic()
+                    
+                    # update agent
+                    self.agent.update_after_reset(
+                        self.replay_buffer, self.logger, self.step, 
+                        gradient_update=self.cfg.reset_update, 
+                        policy_update=True)
                 
                 # reset interact_count
                 interact_count = 0
@@ -510,6 +521,7 @@ class Workspace(object):
                         if self.reward_model.mb_size + self.total_feedback > self.cfg.max_feedback:
                             self.reward_model.set_batch(self.cfg.max_feedback - self.total_feedback)
                             
+                            
                         self.learn_reward()
 
                         self.debug_replay_reward_stats(tag=f"before relabel step={self.step}")
@@ -517,14 +529,16 @@ class Workspace(object):
                         self.debug_replay_reward_stats(tag=f"after relabel step={self.step}")
                         interact_count = 0
                         
-                self.agent.update(self.replay_buffer, self.logger, self.step, 1)
+                if not self.cfg.get('diagRM', False):
+                    self.agent.update(self.replay_buffer, self.logger, self.step, 1)
                 if self.step % 500 == 0:
                     self.debug_replay_reward_stats(tag=f"post-agent-update step={self.step}")
                 
             # unsupervised exploration
             elif self.step > self.cfg.num_seed_steps:
-                self.agent.update_state_ent(self.replay_buffer, self.logger, self.step, 
-                                            gradient_update=1, K=self.cfg.topK)
+                if not self.cfg.get('diagRM', False):
+                    self.agent.update_state_ent(self.replay_buffer, self.logger, self.step, 
+                                                gradient_update=1, K=self.cfg.topK)
                 
             next_obs, reward, done, extra = self.env.step(action)
 
@@ -541,12 +555,14 @@ class Workspace(object):
                 )
 
                 try:
+                    abs_means = np.abs(self.reward_model.norm_mean)
+                    top_indices = np.argsort(abs_means)[-3:][::-1]
+                    top_vals = abs_means[top_indices]
                     print(
                         f"[NORM DBG] count={self.reward_model.norm_count} "
-                        f"mean_abs_mean={np.mean(np.abs(self.reward_model.norm_mean)):.6f} "
+                        f"mean_abs_mean={np.mean(abs_means):.6f} "
                         f"mean_std={np.mean(self.reward_model.norm_std):.6f} "
-                        f"min_std={np.min(self.reward_model.norm_std):.6f} "
-                        f"max_std={np.max(self.reward_model.norm_std):.6f}"
+                        f"TOP3_MEANS: {list(zip(top_indices, top_vals))}"
                     )
                 except Exception as e:
                     print(f"[NORM DBG] failed: {e}")

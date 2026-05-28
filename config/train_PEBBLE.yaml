@@ -3,6 +3,7 @@ defaults:
     
 # this needs to be specified manually
 experiment: PEBBLE
+diagRM: false
 
 # reward learning
 segment: 50
